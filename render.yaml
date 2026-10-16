@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: kalshi-value-finder
+    runtime: python
+    plan: free
+    buildCommand: "echo Ready"
+    startCommand: "python server.py"
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
