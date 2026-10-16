@@ -8,6 +8,8 @@ import json, os, time, math
 HOST=os.environ.get('HOST','0.0.0.0'); PORT=int(os.environ.get('PORT','8765'))
 KALSHI='https://api.elections.kalshi.com/trade-api/v2/markets'
 COINBASE='https://api.exchange.coinbase.com/products/BTC-USD/candles'
+COINBASE_ADV='https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles'
+KRAKEN='https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1'
 def fetch(url):
     with urlopen(Request(url,headers={'User-Agent':'BTC15Signal/2.0','Accept':'application/json'}),timeout=12) as r:return json.load(r)
 def ts(s):return datetime.fromisoformat(s.replace('Z','+00:00')).timestamp()
@@ -20,41 +22,68 @@ def ask(m,side):
                 if math.isfinite(n) and 0<n<=100:return round(n,1)
         except (ValueError,TypeError):pass
     return None
+def minute_history(now):
+    """Fetch 1m candles from independent providers, without mixing sources."""
+    errors=[]
+    sources=[
+        ('Coinbase Exchange', COINBASE+'?'+urlencode({'granularity':60,'start':datetime.fromtimestamp(now-1800, __import__('datetime').timezone.utc).isoformat(),'end':datetime.fromtimestamp(now+60, __import__('datetime').timezone.utc).isoformat()})),
+        ('Coinbase Advanced', COINBASE_ADV+'?'+urlencode({'start':int(now-1800),'end':int(now+60),'granularity':'ONE_MINUTE','limit':35})),
+        ('Kraken', KRAKEN),
+    ]
+    for name,url in sources:
+        try:
+            data=fetch(url)
+            if name=='Coinbase Exchange':
+                rows={int(c[0]):float(c[4]) for c in data if isinstance(c,list) and len(c)>4}
+            elif name=='Coinbase Advanced':
+                rows={int(c['start']):float(c['close']) for c in data.get('candles',[])}
+            else:
+                if data.get('error'):raise ValueError(str(data['error']))
+                values=next(v for k,v in data['result'].items() if k!='last')
+                rows={int(c[0]):float(c[4]) for c in values if len(c)>4}
+            rows={t:v for t,v in rows.items() if math.isfinite(v) and v>0 and t<=now+60}
+            if len(rows)<11:raise ValueError('fewer than 11 one-minute candles')
+            latest=max(rows)
+            # A candle's timestamp is its START; current candle can be up to 60s old.
+            if now-latest>150:raise ValueError('latest candle is stale')
+            # Only use minute-aligned exact historical candles, no approximations.
+            for n in (1,5,10):
+                if latest-n*60 not in rows:raise ValueError(f'missing {n}-minute reference candle')
+            spot=rows[latest]
+            trends={str(n):round((spot/rows[latest-n*60]-1)*100,4) for n in (1,5,10)}
+            return round(spot,2),trends,name,errors
+        except Exception as e:
+            errors.append(name+': '+str(e)[:110])
+    return None,{},None,errors
+
 def build():
-    now=time.time(); result={'timestamp':int(now),'signal':'WAIT','reason':'Checking feeds','spot':None,'trends':{},'market':None,'checks':[],'warnings':[],'data_ok':False,'rule_version':'v2.0'}
+    now=time.time(); result={'timestamp':int(now),'signal':'WAIT','reason':'Checking feeds','spot':None,'trends':{},'market':None,'checks':[],'warnings':[],'data_ok':False,'rule_version':'v3.0','price_source':None,'feed_status':{}}
     try:
         data=fetch(KALSHI+'?'+urlencode({'series_ticker':'KXBTC15M','status':'open','limit':100}))
         markets=[m for m in data.get('markets',[]) if m.get('ticker','').startswith('KXBTC15M-') and m.get('close_time') and ts(m['close_time'])>now+5 and (not m.get('open_time') or ts(m['open_time'])<=now)]
         markets.sort(key=lambda m:ts(m['close_time']))
         if markets:
             m=markets[0];result['market']={'ticker':m['ticker'],'title':m.get('title'),'close_time':m['close_time'],'yes_ask':ask(m,'yes'),'no_ask':ask(m,'no'),'url':'https://kalshi.com/markets/'+m['ticker'].split('-')[0].lower()+'/'+m.get('event_ticker',m['ticker']).lower()}
-        else:result['warnings'].append('No active 15-minute Kalshi BTC market returned.')
-    except Exception as e:result['warnings'].append('Kalshi feed: '+str(e)[:130])
-    try:
-        candles=fetch(COINBASE+'?'+urlencode({'granularity':60}))
-        rows={int(c[0]):float(c[4]) for c in candles if isinstance(c,list) and len(c)>=5 and float(c[4])>0}
-        if len(rows)<12:raise ValueError('Insufficient minute candles')
-        latest=max(rows);spot=rows[latest]
-        if now-latest>180:raise ValueError('Coinbase candles are stale')
-        for minutes in (1,5,10):
-            target=latest-minutes*60
-            candidates=[t for t in rows if abs(t-target)<=65]
-            if not candidates:raise ValueError(f'Missing {minutes}-minute history')
-            t=min(candidates,key=lambda t:abs(t-target));result['trends'][str(minutes)]=round((spot/rows[t]-1)*100,4)
-        result['spot']=round(spot,2)
-    except Exception as e:result['warnings'].append('Coinbase feed: '+str(e)[:130])
+            result['feed_status']['kalshi']='OK'
+        else:
+            result['feed_status']['kalshi']='No open BTC 15m market';result['warnings'].append('No active 15-minute Kalshi BTC market returned.')
+    except Exception as e:
+        result['feed_status']['kalshi']='Error';result['warnings'].append('Kalshi feed: '+str(e)[:130])
+    spot,trends,source,errors=minute_history(now)
+    result['spot']=spot;result['trends']=trends;result['price_source']=source
+    result['feed_status']['bitcoin']=source or 'Unavailable'
+    if source and errors:result['warnings'].append('Backup feed used; earlier sources failed: '+'; '.join(errors))
+    if not source:result['warnings'].extend(errors)
     m=result['market'];t=result['trends']
     if not m or len(t)!=3:
-        result['reason']='Market or price history unavailable. No signal.'
-        result['checks']=['Waiting for verified live feeds']
+        result['reason']='Market or Bitcoin minute-history feed unavailable. No signal.'
+        result['checks']=['Kalshi: '+result['feed_status'].get('kalshi','Unknown'),'Bitcoin history: '+result['feed_status']['bitcoin']]
         return result
     result['data_ok']=True
     remaining=ts(m['close_time'])-now
     result['checks'].append(f'{int(remaining//60)}m {int(remaining%60)}s remaining')
     if remaining<120:
         result['reason']='Less than 2 minutes left in this market.';return result
-    # Experimental, transparent trend classifier; not a probability or expected-value model.
-    # Require medium and longer horizon agreement, plus a modest short-term confirmation.
     t1,t5,t10=t['1'],t['5'],t['10']
     result['checks'].append(f'1m {t1:+.4f}% · 5m {t5:+.4f}% · 10m {t10:+.4f}%')
     if abs(t5)<0.025 or abs(t10)<0.04:
